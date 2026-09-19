@@ -150,6 +150,20 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   （同层任务互不依赖、可并行执行）。分析在**单个只读事务**内读取一致快照，
   随后纯内存计算——不改变任务状态、不产生事件，可并发/重复调用且结果确定。
   DAG 不存在返回 404；存储数据中出现非正时长或图异常（环、悬空依赖）返回 422。
+- **只读领取决策预演**：`POST /tasks/claim-plan` 接受与 `/tasks/claim` 完全一致的
+  `worker_id`/`dag_id`/`limit`（含相同的 422 校验），在**单个 SQLite 只读事务**
+  的一致快照上模拟整批领取：沿用真实领取的候选排序（`rowid` 顺序）、依赖门控、
+  退避时刻、跨 DAG 并发组容量与工作器能力门控，模拟选中的任务在**同批内即时占用
+  并发组容量**，使选中序列与同一快照下的真实批量领取逐项一致。接口**不写入任务、
+  attempt 或事件**：返回 `would_claim`（按序模拟选中的任务，字段与真实领取一致，
+  仅 `lease_token` 恒为 `null`，`lease_expires_at` 为预演推算值）及
+  `unselected_pending`（范围内每个未被选中的 pending 任务的**首个**阻塞原因：
+  `dependencies_unmet` / `backoff_not_eligible` / `concurrency_group_full` /
+  `capability_missing` / `limit_reached`，附前置状态、退避时刻、组上限与占用、
+  缺失能力标签等相关字段）。错误口径与真实领取相同：`dag_id` 不存在
+  `404 dag_not_found`；其余门控均满足仅缺存活能力登记时（含匿名/过期）
+  `409 worker_not_registered` 且不给出选中结果；组满先于能力门控。预演可安全并发、
+  重复调用，不改变任何现有接口的行为。
 
 ## 一条命令启动（端口 8000）
 
@@ -803,6 +817,84 @@ curl -s -X POST http://localhost:8000/templates/nightly-etl/versions/1/instantia
   缺省用模板名）与 `id`（自定义 DAG id，已存在则 `409 dag_exists` 回滚，
   不占幂等键）。
 
+### 13. 只读任务领取决策预演（claim-plan）
+
+想在**不真正领取**的前提下回答「这批任务现在由谁领、能领到哪几个、剩下的为什么领
+不到」时，调用与 `/tasks/claim` 请求参数完全一致的只读预演接口：
+
+```bash
+curl -s -X POST http://localhost:8000/tasks/claim-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"worker_id": "worker-1", "dag_id": "<DAG_ID>", "limit": 10}'
+```
+
+预演在**单个 SQLite 只读事务**（`query_only` 连接 + 快照事务）的一致快照上完成，
+**不写入任务、attempt 或事件**，可安全并发/重复调用。它完整复刻真实领取的裁决：
+候选排序（`rowid` 键集顺序）、依赖全部 `succeeded`、退避时刻 `next_eligible_at`、
+跨 DAG 并发组容量（含**同批即时占位**——模拟选中的任务立即在内存中占用组名额，
+因此结果与同一快照下的真实批量领取一致）、工作器能力门控（存活登记 + 标签超集），
+以及 `limit` 截断与键集翻页的「组满/能力不匹配则跳过、继续填满」语义。
+
+```json
+{
+  "worker_id": "worker-1",
+  "dag_id": "d1",
+  "limit": 10,
+  "would_claim": [
+    {
+      "task_id": "…", "dag_id": "d1", "task_key": "a", "name": "a",
+      "payload": null, "attempt": 1,
+      "lease_token": null,
+      "lease_expires_at": "2026-09-19T11:00:30Z",
+      "lease_seconds": 30.0,
+      "concurrency_group": null,
+      "requires": []
+    }
+  ],
+  "count": 1,
+  "unselected_pending": [
+    {
+      "task_id": "…", "dag_id": "d1", "task_key": "b", "name": "b",
+      "next_eligible_at": null,
+      "concurrency_group": null,
+      "requires": [],
+      "blocked_reason": "dependencies_unmet",
+      "unmet_dependencies": ["a"],
+      "unmet_dependency_states": ["pending"]
+    }
+  ],
+  "unselected_pending_count": 1
+}
+```
+
+- `would_claim`：按真实领取顺序模拟选中的任务，字段与 `/tasks/claim` 的逐项一致，
+  仅 `lease_token` 恒为 `null`（预演不发租约）；`lease_expires_at` 是按
+  「预演时刻 + `lease_seconds`」推算的值，同一时刻真实领取会得到相同的过期时刻。
+  `attempt` 同样按真实口径递增（过期重领为 2、3…）。
+- `unselected_pending`：预演范围内（受 `dag_id` 过滤约束）**每个未被选中的
+  pending 任务**一项，给出按真实门控顺序（依赖/退避 → 并发组容量 → 能力 →
+  limit）裁决出的**首个**阻塞原因及相关字段：
+
+  | `blocked_reason` | 含义 | 附带字段 |
+  | --- | --- | --- |
+  | `dependencies_unmet` | 仍有非 `succeeded` 前置 | `unmet_dependencies`（前置 key 列表）、`unmet_dependency_states`（前置当前状态） |
+  | `backoff_not_eligible` | 显式失败退避未到期（`next_eligible_at > now`） | `next_eligible_at` |
+  | `concurrency_group_full` | 并发组容量被全库未过期租约与同批预占占满 | `group_limit`、`group_occupied`（含同批即时占用） |
+  | `capability_missing` | 登记存活但能力不覆盖全部 `requires` | `missing_capabilities`（缺失标签）、`requires` |
+  | `limit_reached` | 本批已模拟选中 `limit` 个，扫描在此终止（真实批量领取同样停止） | `limit` |
+
+  非 pending 任务（`running`/`succeeded`/`failed`/`blocked`/`canceled`）不在
+  `unselected_pending` 中；其中租约已过期的 running 任务仍会作为重领候选进入
+  `would_claim`（`attempt` 递增），与真实领取口径一致。
+- 错误口径与 `/tasks/claim` 完全相同：`dag_id` 不存在 → `404 dag_not_found`；
+  候选中存在依赖/退避/并发组均满足、仅缺存活能力登记的 `requires` 任务（含匿名、
+  登记缺失或过期）→ `409 worker_not_registered`（details 同真实领取，预演同样不
+  返回任何选中结果，且不写任何数据）；组满先于能力门控，故被满组挡住的
+  `requires` 任务报告 `concurrency_group_full` 而**不**触发 409。
+- 预演不改变任何状态：连续多次调用结果一致；先调用预演再以相同参数真实领取，
+  在无并发写入时选中序列逐项相同（真实领取额外生成新的 `lease_token` 与 attempt
+  记录并追加 `task.claimed` 事件）。
+
 状态变迁与事件 `type` 的对应关系：
 
 | 业务动作 | 事件 type | from_state → to_state |
@@ -831,6 +923,7 @@ curl -s -X POST http://localhost:8000/templates/nightly-etl/versions/1/instantia
 | `GET` | `/templates/{name}/versions/{version}` | 查询指定版本：元数据 + 不可变快照（版本不存在 404） |
 | `POST` | `/templates/{name}/versions/{version}/instantiations` | 参数化实例化（替换 payload 中的 `${name}`）；必须携带 idempotency_key，同键同参返回同一 DAG、参数不同 409、缺参/多参 422 |
 | `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（同事务校验能力登记；跳过满并发组与能力不匹配候选，尽量填满 limit；登记缺失/过期 409） |
+| `POST` | `/tasks/claim-plan` | 只读预演：同参数模拟一次批量领取的决策（同批即时占用并发组容量），返回模拟选中任务与未选中 pending 任务的首个阻塞原因；不写任务/attempt/事件（dag 不存在 404；登记缺失/过期 409） |
 | `PUT` | `/workers/{worker_id}` | 登记/刷新工作器能力：去重能力标签 + 正数 ttl_seconds；重复 PUT 覆盖能力并刷新过期时刻 |
 | `GET` | `/workers/{worker_id}` | 查询登记内容与 alive 存活状态；从未登记 404 |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
@@ -918,4 +1011,11 @@ GET /events 及任务接口并存且行为不变、OpenAPI 文档包含订阅接
 409、幂等作用域按模板与版本隔离、缺参重放不返回首响、自定义 name/id 与已存在
 id 409 回滚不占键、跨 DAG 并发组冲突整体回滚、并发同键异参只创建一个 DAG、
 并发同键同参 200/201 同一 DAG、模板/快照/幂等记录重启后持久化且语义不变、
-直接 POST /dags 行为与响应结构不变、OpenAPI 文档包含模板接口）。
+直接 POST /dags 行为与响应结构不变、OpenAPI 文档包含模板接口）、
+只读领取决策预演（预演选中序列与随后真实领取逐项一致且 `lease_token` 为 null、
+依赖未满足/退避未到期/并发组满（含跨 DAG 占用与同批即时占位，附上限与占用数）/
+能力不匹配（附缺失标签）/limit 截断五类首个阻塞原因、组满先于能力门控、
+匿名/登记缺失/过期遇可匹配 requires 候选 409 且不写数据、退避未到期不触发 409、
+过期 running 租约作为重领候选且 attempt 递增、非 pending 任务不出现在未选中报告、
+dag_id 过滤与 404、limit 参数 422 校验与真实领取同模型、多次预演可重复且不改状态/
+attempts/事件、OpenAPI 文档包含预演接口并与 /tasks/claim 共用请求体）。

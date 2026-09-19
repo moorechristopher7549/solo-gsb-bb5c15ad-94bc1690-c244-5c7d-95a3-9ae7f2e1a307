@@ -155,6 +155,19 @@ def claim_tasks(body: ClaimIn) -> dict:
     return service.claim_tasks(body.worker_id, body.dag_id, body.limit)
 
 
+@app.post(
+    "/tasks/claim-plan",
+    summary="只读预演：模拟一次批量领取的决策（不写任务/attempt/事件）",
+    responses={
+        200: {"description": "返回按顺序模拟选中的任务（无 lease_token）及每个未选中 pending 任务的首个阻塞原因"},
+        404: {"description": "指定的 dag_id 不存在（dag_not_found）"},
+        409: {"description": "候选含 requires 任务但 worker_id 登记缺失或已过期（worker_not_registered），与真实领取同口径"},
+    },
+)
+def plan_claim_tasks(body: ClaimIn) -> dict:
+    return service.plan_claim_tasks(body.worker_id, body.dag_id, body.limit)
+
+
 # ------------------------------------------------------- 工作器能力登记（能力路由）
 
 @app.put(
