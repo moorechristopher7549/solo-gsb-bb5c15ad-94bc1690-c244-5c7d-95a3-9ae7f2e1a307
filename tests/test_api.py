@@ -3591,3 +3591,313 @@ def test_template_endpoints_in_openapi(client):
     # 既有接口仍在文档中
     assert "post" in paths["/dags"]
 
+
+# ------------------------------------------------------------- 只读领取预演 claim-plan
+
+def _plan(client, **body):
+    return client.post("/tasks/claim-plan", json=body)
+
+
+def _reason_map(body):
+    return {u["task_key"]: u for u in body["unselected"]}
+
+
+def test_claim_plan_is_readonly(client):
+    """预演不写入任务状态、attempt 或事件。"""
+    dag = submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}])
+    before = client.get(f"/dags/{dag['id']}").json()
+    events_before = client.get("/events").json()
+
+    r = _plan(client, dag_id=dag["id"], limit=10)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["simulated"] is True
+    assert body["dag_id"] == dag["id"]
+    assert body["limit"] == 10
+    assert [t["task_key"] for t in body["claimed"]] == ["a"]
+
+    after = client.get(f"/dags/{dag['id']}").json()
+    assert before["states"] == after["states"]
+    assert before["tasks"][0]["state"] == "pending"
+    # 无 attempt 产生
+    for t in after["tasks"]:
+        assert client.get(f"/tasks/{t['id']}").json()["attempts"] == []
+    # 无事件追加
+    assert client.get("/events").json()["events"] == events_before["events"]
+    # 预演结果不含真实租约令牌
+    assert body["claimed"][0]["lease_token"] is None
+    assert body["claimed"][0]["lease_expires_at"] is not None
+
+
+def test_claim_plan_matches_real_claim_selection_order(client):
+    """同一快照下预演选中序列与真实批量领取一致（含同批并发组即时占位与跳过）。"""
+    submit(
+        client,
+        [
+            {"key": "g1", "concurrency_group": "g", "concurrency_limit": 2},
+            {"key": "g2", "concurrency_group": "g", "concurrency_limit": 2},
+            {"key": "g3", "concurrency_group": "g", "concurrency_limit": 2},
+            {"key": "u1"},
+            {"key": "u2"},
+        ],
+        dag_id="plan-match",
+    )
+    plan = _plan(client, dag_id="plan-match", limit=5).json()
+    assert [t["task_key"] for t in plan["claimed"]] == ["g1", "g2", "u1", "u2"]
+    reasons = _reason_map(plan)
+    assert set(reasons) == {"g3"}
+    assert reasons["g3"]["reason"] == "concurrency_group_full"
+    assert reasons["g3"]["concurrency_group"] == "g"
+    assert reasons["g3"]["group_limit"] == 2
+    assert reasons["g3"]["group_occupied"] == 2
+
+    # 随后真实领取得到完全相同的选中序列（预演未改变任何状态）
+    real = client.post("/tasks/claim", json={"dag_id": "plan-match", "limit": 5}).json()
+    assert [t["task_key"] for t in real["claimed"]] == ["g1", "g2", "u1", "u2"]
+
+    # 真实领取后再预演：g3 仍被组容量挡住，且此时无任务被选中
+    plan2 = _plan(client, dag_id="plan-match", limit=5).json()
+    assert plan2["claimed"] == []
+    assert plan2["unselected"][0]["reason"] == "concurrency_group_full"
+
+
+def test_claim_plan_group_occupied_includes_existing_running_leases(client):
+    """预演的组占用同时统计已存在的未过期 running 租约与本批模拟占位。"""
+    submit(
+        client,
+        [{"key": "a1", "concurrency_group": "shared", "concurrency_limit": 2}],
+        dag_id="pa",
+    )
+    submit(
+        client,
+        [
+            {"key": "b1", "concurrency_group": "shared", "concurrency_limit": 2},
+            {"key": "b2", "concurrency_group": "shared", "concurrency_limit": 2},
+            {"key": "free"},
+        ],
+        dag_id="pb",
+    )
+    # 先真实占掉 1 个名额
+    client.post("/tasks/claim", json={"dag_id": "pa", "limit": 5})
+
+    plan = _plan(client, dag_id="pb", limit=5).json()
+    assert [t["task_key"] for t in plan["claimed"]] == ["b1", "free"]
+    reasons = _reason_map(plan)
+    assert reasons["b2"]["reason"] == "concurrency_group_full"
+    # 已有占用 1（a1）+ 本批 b1 即时占位 1
+    assert reasons["b2"]["group_occupied"] == 2
+
+
+def test_claim_plan_unselected_dependency_and_backoff_reasons(client):
+    """未选中 pending 任务给出首个阻塞原因：依赖优先于退避。"""
+    submit(
+        client,
+        [
+            {"key": "a", "max_retries": 2, "retry_backoff": BACKOFF},
+            {"key": "b", "deps": ["a"]},
+            {"key": "c", "deps": ["b"]},
+        ],
+        dag_id="plan-deps",
+    )
+    t = client.post("/tasks/claim", json={"dag_id": "plan-deps"}).json()["claimed"][0]
+    # a 显式失败进入退避等待（pending, next_eligible_at 未到）
+    _complete(client, t, "fail-1", success=False)
+
+    plan = _plan(client, dag_id="plan-deps", limit=10).json()
+    assert plan["claimed"] == []
+    reasons = _reason_map(plan)
+    # 退避优先（a 无未完成前置）
+    assert reasons["a"]["reason"] == "backoff_not_elapsed"
+    assert reasons["a"]["next_eligible_at"]
+    # b 的前置 a 处于 pending：依赖阻塞先于自身其他门控
+    assert reasons["b"]["reason"] == "dependency_not_succeeded"
+    assert reasons["b"]["blocked_by"] == [{"task_key": "a", "state": "pending"}]
+    assert reasons["c"]["reason"] == "dependency_not_succeeded"
+    blocked_c = {d["task_key"]: d["state"] for d in reasons["c"]["blocked_by"]}
+    assert blocked_c == {"b": "pending"}
+
+
+def test_claim_plan_dependency_blocked_by_running_and_terminal_states(client):
+    submit(
+        client,
+        [
+            {"key": "ok"},
+            {"key": "work"},
+            {"key": "late", "deps": ["ok", "work"]},
+        ],
+        dag_id="plan-blockedby",
+    )
+    claimed = client.post("/tasks/claim", json={"dag_id": "plan-blockedby", "limit": 10}).json()["claimed"]
+    by_token = {t["task_key"]: t for t in claimed}
+    # ok 成功；work 保持 running（未过期）
+    _complete(client, by_token["ok"], "ok-1", success=True)
+
+    plan = _plan(client, dag_id="plan-blockedby", limit=10).json()
+    # work 持有未过期租约，不是候选；late 被依赖挡住
+    assert plan["claimed"] == []
+    reasons = _reason_map(plan)
+    assert reasons["late"]["reason"] == "dependency_not_succeeded"
+    blocked = {d["task_key"]: d["state"] for d in reasons["late"]["blocked_by"]}
+    # ok 已 succeeded 不在阻塞列表；work running 是唯一阻塞前置
+    assert blocked == {"work": "running"}
+
+
+def test_claim_plan_simulated_running_dependency_unblocks_within_batch_check(client):
+    """本批模拟选中的 pending 前置按 running 计入阻塞前置（仍非 succeeded）。"""
+    submit(
+        client,
+        [{"key": "a"}, {"key": "b", "deps": ["a"]}],
+        dag_id="plan-sim",
+    )
+    plan = _plan(client, dag_id="plan-sim", limit=10).json()
+    assert [t["task_key"] for t in plan["claimed"]] == ["a"]
+    reasons = _reason_map(plan)
+    assert reasons["b"]["reason"] == "dependency_not_succeeded"
+    assert reasons["b"]["blocked_by"] == [{"task_key": "a", "state": "running"}]
+
+
+def test_claim_plan_limit_reached_reason(client):
+    submit(client, [{"key": "a"}, {"key": "b"}, {"key": "c"}], dag_id="plan-limit")
+    plan = _plan(client, dag_id="plan-limit", limit=2).json()
+    assert [t["task_key"] for t in plan["claimed"]] == ["a", "b"]
+    reasons = _reason_map(plan)
+    assert reasons["c"]["reason"] == "limit_reached"
+    assert reasons["c"]["limit"] == 2
+
+
+def test_claim_plan_capability_mismatch_skip_and_parity(client):
+    _requires_dag(client, dag_id="plan-cap")
+    register(client, "w-gpu", ["gpu"])
+    plan = _plan(client, worker_id="w-gpu", dag_id="plan-cap", limit=10).json()
+    assert [t["task_key"] for t in plan["claimed"]] == ["plain", "gpu"]
+    reasons = _reason_map(plan)
+    assert reasons["both"]["reason"] == "capability_mismatch"
+    assert reasons["both"]["requires"] == ["gpu", "io"]
+    assert "gpu" in reasons["both"]["capabilities"]
+
+    real = client.post(
+        "/tasks/claim", json={"worker_id": "w-gpu", "dag_id": "plan-cap", "limit": 10}
+    ).json()
+    assert [t["task_key"] for t in real["claimed"]] == ["plain", "gpu"]
+
+
+def test_claim_plan_409_when_worker_not_registered_before_batch_fills(client):
+    _requires_dag(client, dag_id="plan-409")
+    r = _plan(client, dag_id="plan-409", limit=10)
+    assert r.status_code == 409
+    body = r.json()["error"]
+    assert body["code"] == "worker_not_registered"
+    assert body["details"]["worker_id"] is None
+    assert body["details"]["requires"] == ["gpu"]
+    # 409 同样不写入：任务仍全部 pending、无领取类事件
+    dag = client.get("/dags/plan-409").json()
+    assert dag["states"]["pending"] == 3
+    events = client.get("/events", params={"dag_id": "plan-409"}).json()["events"]
+    assert all(e["type"] == "dag.created" for e in events)
+
+
+def test_claim_plan_no_409_for_requires_candidate_after_limit_reached(client):
+    """批量填满后才遇到的 requires 候选不再触发 409（与真实领取扫描边界一致）。"""
+    tasks = [{"key": f"p{i}"} for i in range(3)]
+    tasks.append({"key": "late-gpu", "requires": ["gpu"]})
+    submit(client, tasks, dag_id="plan-late-gpu")
+    # limit=3：前 3 个无能力要求任务填满后才轮到 late-gpu
+    r = _plan(client, dag_id="plan-late-gpu", limit=3)
+    assert r.status_code == 200
+    body = r.json()
+    assert [t["task_key"] for t in body["claimed"]] == ["p0", "p1", "p2"]
+    reasons = _reason_map(body)
+    assert reasons["late-gpu"]["reason"] == "limit_reached"
+
+
+def test_claim_plan_409_parity_with_real_claim_when_capacity_skips_first(client):
+    """满组挡住的 requires 候选先被组容量跳过（不触发 409），门控顺序与真实领取一致。"""
+    submit(
+        client,
+        [{"key": "a", "concurrency_group": "g", "concurrency_limit": 1, "requires": ["gpu"]}],
+        dag_id="g-full",
+    )
+    # 占用唯一名额（真实领取需要有能力的 worker）
+    register(client, "w-gpu", ["gpu"])
+    client.post("/tasks/claim", json={"worker_id": "w-gpu", "dag_id": "g-full", "limit": 5})
+    submit(
+        client,
+        [{"key": "b", "concurrency_group": "g", "concurrency_limit": 1, "requires": ["gpu"]}],
+        dag_id="g-full-2",
+    )
+    # 匿名预演：b 先被满组挡住，不触发能力 409
+    plan = _plan(client, dag_id="g-full-2", limit=5).json()
+    assert plan["claimed"] == []
+    assert plan["unselected"][0]["reason"] == "concurrency_group_full"
+
+
+def test_claim_plan_expired_lease_reclaimable_and_releases_nothing_pending(client):
+    """过期租约任务可被模拟重领；它不是 pending，不出现在 unselected 中。"""
+    submit(client, [{"key": "a", "lease_seconds": 0.1}], dag_id="plan-exp")
+    client.post("/tasks/claim", json={"dag_id": "plan-exp"})
+    time.sleep(0.15)
+    plan = _plan(client, dag_id="plan-exp", limit=10).json()
+    assert [t["task_key"] for t in plan["claimed"]] == ["a"]
+    assert plan["claimed"][0]["attempt"] == 2
+    assert plan["unselected"] == []
+    # 状态仍是 running、attempt 仍为 1（预演未写）
+    dag = client.get("/dags/plan-exp").json()
+    assert dag["states"]["running"] == 1
+    assert dag["tasks"][0]["attempt"] == 1
+
+
+def test_claim_plan_unknown_dag_404(client):
+    r = _plan(client, dag_id="nope")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "dag_not_found"
+
+
+def test_claim_plan_uses_claim_request_validation(client):
+    """请求参数与 /tasks/claim 一致：同样的 422 校验口径。"""
+    assert _plan(client, limit=0).status_code == 422
+    assert _plan(client, limit=101).status_code == 422
+
+
+def test_claim_plan_repeated_calls_are_deterministic_and_readonly(client):
+    submit(client, [{"key": "a"}, {"key": "b"}], dag_id="plan-repeat")
+    r1 = _plan(client, dag_id="plan-repeat", limit=1).json()
+    r2 = _plan(client, dag_id="plan-repeat", limit=1).json()
+    assert [t["task_id"] for t in r1["claimed"]] == [t["task_id"] for t in r2["claimed"]]
+    assert r1["unselected"] == r2["unselected"]
+    dag = client.get("/dags/plan-repeat").json()
+    assert dag["states"]["pending"] == 2
+
+
+def test_claim_plan_unselected_only_contains_pending_tasks(client):
+    """succeeded/running/blocked/canceled 任务不出现在未选中说明中。"""
+    submit(
+        client,
+        [
+            {"key": "done"},
+            {"key": "kid", "deps": ["done"]},
+            {"key": "go"},
+        ],
+        dag_id="plan-states",
+    )
+    claimed = client.post("/tasks/claim", json={"dag_id": "plan-states", "limit": 10}).json()["claimed"]
+    done = next(t for t in claimed if t["task_key"] == "done")
+    go = next(t for t in claimed if t["task_key"] == "go")
+    _complete(client, done, "done-ok", success=True)
+    _complete(client, go, "go-fail", success=False, error="x")  # max_retries=0 -> failed
+
+    plan = _plan(client, dag_id="plan-states", limit=10).json()
+    keys = {u["task_key"] for u in plan["unselected"]}
+    # kid 因上游 done 已成功而变为可领取（go 的失败不影响 kid）；go 是 failed 非 pending
+    assert "go" not in keys
+    selected_keys = {t["task_key"] for t in plan["claimed"]}
+    assert "kid" in selected_keys
+
+
+def test_claim_plan_endpoint_in_openapi(client):
+    spec = client.get("/openapi.json").json()
+    assert "/tasks/claim-plan" in spec["paths"]
+    post = spec["paths"]["/tasks/claim-plan"]["post"]
+    assert {"200", "404", "409", "422"} <= set(post["responses"])
+    # 既有领取接口保持不变
+    assert "/tasks/claim" in spec["paths"]
+

@@ -18,6 +18,29 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   不留 DAG/任务/事件痕迹）；同一批内自相矛盾（同名组不同上限）返回 422。
   一次批量领取中新任务立即占位，已满的组会被**跳过并继续**寻找其他可领取任务
   （其他组或无组任务），尽量填满 `limit`。未声明组的任务行为完全不变。
+- **只读的领取决策预演（claim-plan）**：`POST /tasks/claim-plan` 的请求参数与
+  `POST /tasks/claim` **完全一致**（`worker_id`/`dag_id`/`limit`），在**单个
+  SQLite 只读事务**的一致快照上**模拟**真实领取的完整裁决——同样的候选排序
+  （rowid）、依赖门控、退避时刻、并发组容量（全库跨 DAG）与工作器能力门控，
+  **同批模拟选中的任务即时占用并发组容量**，因此选中序列与同一快照下的真实
+  批量领取一致。接口**绝不写入**任务、attempt 或事件（连接置 `query_only`
+  兜底，事务以 ROLLBACK 收尾），可安全并发/重复调用。响应在 `claimed` 中按
+  模拟选中顺序返回任务（结构与真实领取相同，但**不签发真实租约令牌**：
+  `lease_token` 恒为 `null`，`lease_expires_at` 仅为按当前 `lease_seconds`
+  的模拟值），并在 `unselected` 中为每个**未选中的 pending 任务**给出**首个
+  阻塞原因**及相关字段，原因为以下之一（按门控顺序）：
+  `dependency_not_succeeded`（`blocked_by` 列出每个未 `succeeded` 的前置及其
+  模拟后状态）、`backoff_not_elapsed`（携带 `next_eligible_at`）、
+  `concurrency_group_full`（携带 `concurrency_group`/`group_limit`/
+  `group_occupied`，占用含本批模拟占位）、`capability_mismatch`（携带任务
+  `requires` 与工作器当前 `capabilities`）、`limit_reached`（携带本次
+  `limit`）。指定 `dag_id` 不存在返回 `404 dag_not_found`；批量填满之前遇到
+  requires 候选但领取者无存活能力登记时，与真实领取同语义返回
+  `409 worker_not_registered`（details 相同，同样不落任何写入）；候选在限额
+  填满之后才被遇到则不触发 409，仅记为 `limit_reached`。`succeeded`/
+  `running`/`failed`/`blocked`/`canceled` 任务不属于 pending，不出现在
+  `unselected`（其中过期租约的 running 任务可被模拟重领，计入 `claimed`）。
+  该模块只复用领取裁决与快照，**不改变 `/tasks/claim` 及任何既有接口的行为**。
 - **工作器能力登记与能力路由**：工作器通过 `PUT /workers/{worker_id}` 登记
   **去重后的能力标签**（`capabilities`，按首次出现顺序持久化，空数组合法）与
   **正数** `ttl_seconds`（登记存活时长，非正返回 422）。重复 PUT 是覆盖语义：
@@ -396,6 +419,81 @@ curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/
 curl -s http://localhost:8000/tasks/<TASK_ID> | jq '{key, requires, state}'
 # {"key":"train","requires":["gpu"],"state":"running"}
 ```
+
+#### 只读预演：POST /tasks/claim-plan
+
+想在**不实际领取**的情况下查看「此刻发起一次批量领取会选中哪些任务、其余
+pending 任务为什么选不上」时，调用 `claim-plan`：请求体与 `/tasks/claim`
+完全相同，整个计算在单个 SQLite 只读事务内完成，不改任务、不产生 attempt
+或事件，可以反复调用。
+
+```bash
+# 沿用上面 cap-dag（prepare / train[gpu] / export[gpu,io]）与 w-gpu（仅 gpu）
+curl -s -X POST http://localhost:8000/tasks/claim-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"worker_id": "w-gpu", "dag_id": "cap-dag", "limit": 10}' | jq
+```
+
+```json
+{
+  "simulated": true,
+  "worker_id": "w-gpu",
+  "dag_id": "cap-dag",
+  "limit": 10,
+  "evaluated_at": "2026-09-19T12:00:00Z",
+  "claimed": [
+    {"task_id": "…", "dag_id": "cap-dag", "task_key": "prepare", "attempt": 1,
+     "lease_token": null, "lease_expires_at": "2026-09-19T12:00:30Z",
+     "lease_seconds": 30.0, "concurrency_group": null, "requires": []},
+    {"task_id": "…", "dag_id": "cap-dag", "task_key": "train", "attempt": 1,
+     "lease_token": null, "lease_expires_at": "2026-09-19T12:00:30Z",
+     "lease_seconds": 30.0, "concurrency_group": null, "requires": ["gpu"]}
+  ],
+  "count": 2,
+  "unselected": [
+    {"task_id": "…", "dag_id": "cap-dag", "task_key": "export",
+     "reason": "capability_mismatch",
+     "message": "工作器存活登记的能力不覆盖任务要求的全部标签",
+     "requires": ["gpu", "io"], "capabilities": ["gpu"]}
+  ]
+}
+```
+
+- `claimed` 是按真实领取的候选排序与门控**模拟选中**的序列；同批选中的任务会
+  **即时占用并发组容量**，因此紧接着对同一数据库调用 `/tasks/claim` 会得到
+  相同的 `task_key` 序列（预演不改变状态，真实领取随后正常落库）。
+- 模拟任务**不签发租约**：`lease_token` 恒为 `null`，不能用于心跳或回报；
+  `lease_expires_at` 仅为按 `evaluated_at + lease_seconds` 的模拟值。
+- `unselected` 只包含**未选中的 pending 任务**，按候选行顺序给出首个阻塞原因：
+
+| reason | 含义 | 相关字段 |
+| --- | --- | --- |
+| `dependency_not_succeeded` | 仍有前置未 `succeeded`（最先裁决） | `blocked_by`：每个未完成前置的 `task_key` 与模拟后 `state` |
+| `backoff_not_elapsed` | 显式失败的退避时刻未到 | `next_eligible_at` |
+| `concurrency_group_full` | 并发组已满（含本批模拟占位，先于能力门控） | `concurrency_group`、`group_limit`、`group_occupied` |
+| `capability_mismatch` | 工作器存活登记不覆盖全部 requires 标签 | `requires`、`capabilities` |
+| `limit_reached` | 本批 `limit` 个名额已被前面的任务占满 | `limit` |
+
+并发组同批即时占位的例子（组上限 2，三个组任务 + 两个无组任务，`limit=5`）：
+
+```bash
+curl -s -X POST http://localhost:8000/tasks/claim-plan -H 'Content-Type: application/json' \
+  -d '{"dag_id": "<DAG_ID>", "limit": 5}' | jq '{claimed: [.claimed[].task_key],
+       unselected: [.unselected[] | {task_key, reason, group_occupied}]}'
+# {
+#   "claimed": ["g1", "g2", "u1", "u2"],
+#   "unselected": [
+#     {"task_key": "g3", "reason": "concurrency_group_full", "group_occupied": 2}
+#   ]
+# }
+```
+
+依赖 + 退避的例子：`a` 失败退避中、`b` 依赖 `a`、`c` 依赖 `b` 时，预演返回
+`a → backoff_not_elapsed`、`b/c → dependency_not_succeeded`（`blocked_by`
+中前置的 `state` 把本批模拟选中的任务记为 `running`）。匿名（或登记过期）预演
+在批量填满前遇到 requires 候选时与真实领取一样返回
+`409 worker_not_registered`；指定不存在的 `dag_id` 返回 `404 dag_not_found`。
+预演后任务状态、attempt 历史与事件流均不发生任何变化。
 
 ### 4. 续租（心跳）
 
@@ -831,6 +929,7 @@ curl -s -X POST http://localhost:8000/templates/nightly-etl/versions/1/instantia
 | `GET` | `/templates/{name}/versions/{version}` | 查询指定版本：元数据 + 不可变快照（版本不存在 404） |
 | `POST` | `/templates/{name}/versions/{version}/instantiations` | 参数化实例化（替换 payload 中的 `${name}`）；必须携带 idempotency_key，同键同参返回同一 DAG、参数不同 409、缺参/多参 422 |
 | `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（同事务校验能力登记；跳过满并发组与能力不匹配候选，尽量填满 limit；登记缺失/过期 409） |
+| `POST` | `/tasks/claim-plan` | 只读预演领取决策：参数与 `/tasks/claim` 一致，单一只读事务模拟同批即时占位，返回模拟选中序列与未选中 pending 任务的首个阻塞原因；不写任务/attempt/事件（dag 不存在 404，登记缺失/过期 409） |
 | `PUT` | `/workers/{worker_id}` | 登记/刷新工作器能力：去重能力标签 + 正数 ttl_seconds；重复 PUT 覆盖能力并刷新过期时刻 |
 | `GET` | `/workers/{worker_id}` | 查询登记内容与 alive 存活状态；从未登记 404 |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
@@ -918,4 +1017,12 @@ GET /events 及任务接口并存且行为不变、OpenAPI 文档包含订阅接
 409、幂等作用域按模板与版本隔离、缺参重放不返回首响、自定义 name/id 与已存在
 id 409 回滚不占键、跨 DAG 并发组冲突整体回滚、并发同键异参只创建一个 DAG、
 并发同键同参 200/201 同一 DAG、模板/快照/幂等记录重启后持久化且语义不变、
-直接 POST /dags 行为与响应结构不变、OpenAPI 文档包含模板接口）。
+直接 POST /dags 行为与响应结构不变、OpenAPI 文档包含模板接口）、
+只读领取决策预演（模拟选中序列与真实领取在同批并发组即时占位/跳过/依赖/退避/
+能力门控上一致、已有未过期租约与跨 DAG 组占用计入、未选中 pending 任务的首个
+阻塞原因按依赖→退避→组满→能力→限额顺序给出及相关字段、依赖前置按模拟后
+running 状态报告、满组先于能力门控不触发 409、登记缺失在批量填满前 409 且不
+落事件、限额填满后遇到 requires 候选不触发 409 而记 limit_reached、过期租约
+可模拟重领且不计入 unselected、预演不写任务/attempt/事件且不签发租约令牌、
+重复调用确定性、参数校验与 404 同 claim 口径、OpenAPI 文档包含新接口且
+/tasks/claim 行为不变）。

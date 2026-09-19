@@ -35,8 +35,8 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Dependency-Aware Task Lease API",
-    version="1.2.0",
-    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果；支持工作器能力登记与 requires 能力路由；提供可复用 DAG 模板（版本化快照与参数化实例化）。",
+    version="1.3.0",
+    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果；支持工作器能力登记与 requires 能力路由；提供可复用 DAG 模板（版本化快照与参数化实例化）；提供只读的领取决策预演（POST /tasks/claim-plan）。",
     lifespan=lifespan,
 )
 
@@ -153,6 +153,20 @@ def instantiate_template(name: str, version: int, body: TemplateInstantiateIn):
 )
 def claim_tasks(body: ClaimIn) -> dict:
     return service.claim_tasks(body.worker_id, body.dag_id, body.limit)
+
+
+@app.post(
+    "/tasks/claim-plan",
+    summary="只读预演领取决策（不写入任务/attempt/事件）",
+    responses={
+        200: {"description": "按真实领取的排序与门控模拟：返回将被选中的任务（无租约令牌）与未选中 pending 任务的首个阻塞原因"},
+        404: {"description": "指定的 dag_id 不存在（dag_not_found）"},
+        409: {"description": "与真实领取同语义：批量填满前遇到 requires 候选但 worker_id 登记缺失或已过期（worker_not_registered）"},
+    },
+)
+def plan_claims(body: ClaimIn) -> dict:
+    # 请求参数与 /tasks/claim 完全一致（ClaimIn）；整个计算在单个 SQLite 只读事务内完成
+    return service.plan_claims(body.worker_id, body.dag_id, body.limit)
 
 
 # ------------------------------------------------------- 工作器能力登记（能力路由）
